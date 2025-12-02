@@ -31,3 +31,22 @@ DB_NAME = os.getenv("DB_NAME", "chat_history")
 DB_USER = os.getenv("DB_USER", "username")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "password")
 
+# RAG 설정
+USE_RAG = os.getenv("USE_RAG", "true").lower() == "true"
+
+# Pinecone 설정
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
+PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT", "gcp-starter")
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "lionhelper-faq")
+
+# 로컬 임베딩 설정 (Sentence Transformers)
+# 한국어 특화 모델: jhgan/ko-sroberta-multitask (384차원)
+# 다국어 모델: paraphrase-multilingual-MiniLM-L12-v2 (384차원)
+# 고성능 다국어: intfloat/multilingual-e5-large (1024차원)
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "jhgan/ko-sroberta-multitask")
+EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "384"))
+
+# 벡터 검색 설정
+TOP_K_RESULTS = int(os.getenv("TOP_K_RESULTS", "5"))
+MIN_SIMILARITY_SCORE = float(os.getenv("MIN_SIMILARITY_SCORE", "0.7"))
+

@@ -28,7 +28,16 @@ from fastapi.exceptions import RequestValidationError
 from config.settings import (
     ANTHROPIC_API_KEY,
     SLACK_BOT_TOKEN,
-    OLLAMA_MODEL
+    OLLAMA_MODEL,
+    # RAG 설정
+    USE_RAG,
+    PINECONE_API_KEY,
+    PINECONE_INDEX_NAME,
+    PINECONE_ENVIRONMENT,
+    EMBEDDING_MODEL,
+    EMBEDDING_DIMENSION,
+    TOP_K_RESULTS,
+    MIN_SIMILARITY_SCORE
 )
 
 # 모델 import
@@ -50,11 +59,23 @@ from database.operations import (
 from ai.claude_client import ClaudeAPIClient
 from ai.qa_data import QA_DATABASE
 from ai.qa_search import (
-    find_related_questions_smart,
+    find_related_questions_smart as find_related_questions_smart_legacy,
     analyze_question_intent,
     find_best_match,
     get_context_keywords
 )
+
+# RAG 모듈 import (조건부)
+rag_search_engine = None
+if USE_RAG and PINECONE_API_KEY:
+    try:
+        from ai.embeddings import EmbeddingClient
+        from ai.pinecone_client import PineconeClient
+        from ai.qa_search_rag import RAGSearchEngine, find_related_questions_smart as find_related_questions_smart_rag
+        from ai.data_loader import load_and_upload_to_pinecone
+    except ImportError as e:
+        logger.warning(f"RAG 모듈 import 실패: {str(e)}. 기존 키워드 방식 사용")
+        USE_RAG = False
 
 # 서비스 import
 from services.chat_service import call_claude_with_knowledge
@@ -77,6 +98,40 @@ if ANTHROPIC_API_KEY:
         logger.info("Claude 클라이언트 초기화 완료")
     except Exception as e:
         logger.warning(f"Claude 클라이언트 초기화 실패: {str(e)}")
+
+# RAG 클라이언트 초기화
+embedding_client = None
+pinecone_client = None
+rag_search_engine = None
+
+if USE_RAG and PINECONE_API_KEY:
+    try:
+        logger.info("🚀 RAG 시스템 초기화 시작...")
+        
+        # 로컬 임베딩 클라이언트 초기화 (무료, API 키 불필요)
+        embedding_client = EmbeddingClient(model=EMBEDDING_MODEL)
+        logger.info(f"✅ 로컬 임베딩 클라이언트 초기화 완료")
+        logger.info(f"   모델: {EMBEDDING_MODEL} (무료, 로컬 실행)")
+        
+        # Pinecone 클라이언트 초기화
+        pinecone_client = PineconeClient(
+            api_key=PINECONE_API_KEY,
+            index_name=PINECONE_INDEX_NAME,
+            dimension=EMBEDDING_DIMENSION,
+            environment=PINECONE_ENVIRONMENT
+        )
+        logger.info(f"Pinecone 클라이언트 초기화 완료 (인덱스: {PINECONE_INDEX_NAME})")
+        
+        # RAG 검색 엔진 초기화
+        rag_search_engine = RAGSearchEngine(embedding_client, pinecone_client)
+        logger.info("RAG 검색 엔진 초기화 완료")
+        
+    except Exception as e:
+        logger.error(f"RAG 시스템 초기화 실패: {str(e)}")
+        logger.info("기존 키워드 방식으로 대체 사용")
+        USE_RAG = False
+else:
+    logger.info("RAG 시스템 비활성화 - 기존 키워드 방식 사용")
 
 # 슬랙 클라이언트 초기화
 slack_client = WebClient(token=SLACK_BOT_TOKEN) if SLACK_BOT_TOKEN else None
@@ -164,12 +219,36 @@ async def startup_event():
     except Exception as e:
         logger.error(f"데이터베이스 초기화 실패: {e}")
         pass
+    
+    # RAG 데이터 로드
+    if USE_RAG and embedding_client and pinecone_client:
+        try:
+            logger.info("FAQ 데이터 Pinecone 업로드 확인...")
+            xlsx_path = os.path.join(os.path.dirname(__file__), "ITLab_FAQ.xlsx")
+            
+            if os.path.exists(xlsx_path):
+                result = load_and_upload_to_pinecone(
+                    xlsx_path=xlsx_path,
+                    embedding_client=embedding_client,
+                    pinecone_client=pinecone_client,
+                    force_reload=False  # 기존 데이터가 있으면 건너뜀
+                )
+                logger.info(f"FAQ 데이터 업로드 결과: {result.get('message')}")
+            else:
+                logger.warning(f"XLSX 파일을 찾을 수 없습니다: {xlsx_path}")
+        except Exception as e:
+            logger.error(f"FAQ 데이터 업로드 실패: {str(e)}")
+            logger.info("기존 Pinecone 데이터 사용 (있는 경우)")
 
-print("🤖 Claude + 키워드 기반 지능형 AI 챗봇 시스템이 로드되었습니다.")
+print("🤖 라이언 헬퍼 AI 챗봇 시스템이 로드되었습니다.")
+if USE_RAG and rag_search_engine:
+    print("✅ RAG 모드: 활성화됨 (Pinecone + OpenAI)")
+elif QA_DATABASE:
+    print("✅ 키워드 모드: 활성화됨 (레거시)")
 if claude_client:
-    print("Claude-3-Haiku: 활성화됨")
+    print("✅ Claude-3-Haiku: 활성화됨")
 else:
-    print("Claude-3-Haiku: 비활성화됨 (API 키 확인 필요)")
+    print("⚠️  Claude-3-Haiku: 비활성화됨 (API 키 확인 필요)")
 
 # CORS preflight 요청을 위한 OPTIONS 핸들러
 @app.options("/{full_path:path}")
@@ -215,13 +294,21 @@ async def chat_with_hybrid(request: ChatRequest):
         if request.use_claude:
             logger.info("🧠 Claude 지능형 응답 시스템 시작")
             
-            # 관련 키워드 정보 검색
-            related_data = find_related_questions_smart(
-                request.prompt, 
-                limit=5,
-                min_score=0.2,
-                context_keywords=[]
-            )
+            # 관련 키워드 정보 검색 (RAG 또는 레거시)
+            if USE_RAG and rag_search_engine:
+                related_data = find_related_questions_smart_rag(
+                    request.prompt, 
+                    limit=5,
+                    min_score=0.7,
+                    rag_engine=rag_search_engine
+                )
+            else:
+                related_data = find_related_questions_smart_legacy(
+                    request.prompt, 
+                    limit=5,
+                    min_score=0.2,
+                    context_keywords=[]
+                )
             
             # Claude가 키워드 정보를 참고해서 지능적 답변 생성
             try:
@@ -273,8 +360,9 @@ async def chat_with_hybrid(request: ChatRequest):
             except Exception as e:
                 logger.error(f"Claude 지능형 응답 실패: {str(e)}")
         
-        # 키워드 기반 처리
-        logger.info("키워드 기반 검색 모드 시작")
+        # 키워드/RAG 기반 처리
+        search_mode = "RAG 검색" if (USE_RAG and rag_search_engine) else "키워드 검색"
+        logger.info(f"{search_mode} 모드 시작")
         
         # 질문 의도 분석
         user_intent = analyze_question_intent(request.prompt)
@@ -320,51 +408,72 @@ async def chat_with_hybrid(request: ChatRequest):
                 model_response_time_ms=None
             )
         
-        # 컨텍스트 키워드 추출
-        context_keywords = get_context_keywords(request.session_id) if request.session_id else []
-        
-        # 키워드 기반 빠른 응답 시도
-        best_match, score, matched_keywords = find_best_match(request.prompt)
-        
-        # 관련 질문들 검색
-        related_questions_data = find_related_questions_smart(
-            request.prompt, 
-            limit=8,
-            min_score=0.2,
-            context_keywords=context_keywords
-        )
+        # 관련 질문들 검색 (RAG 또는 레거시)
+        if USE_RAG and rag_search_engine:
+            # RAG 모드
+            related_questions_data = find_related_questions_smart_rag(
+                request.prompt, 
+                limit=8,
+                min_score=0.6,
+                rag_engine=rag_search_engine
+            )
+            # RAG에서는 첫 번째 결과를 best_match로 사용
+            best_match = related_questions_data[0] if related_questions_data else None
+            score = best_match['score'] if best_match else 0
+            matched_keywords = best_match.get('matched_keywords', []) if best_match else []
+        else:
+            # 레거시 키워드 모드
+            context_keywords = get_context_keywords(request.session_id) if request.session_id else []
+            best_match, score, matched_keywords = find_best_match(request.prompt)
+            related_questions_data = find_related_questions_smart_legacy(
+                request.prompt, 
+                limit=8,
+                min_score=0.2,
+                context_keywords=context_keywords
+            )
         related_questions = []
         
-        # 키워드 기반 답변 선택 로직
+        # 답변 선택 로직 (RAG 또는 레거시)
         response = "죄송합니다. 해당 질문에 대한 정확한 답변을 찾을 수 없습니다.\n\n구체적인 키워드(예: 훈련장려금, 출결, 줌 등)로 다시 질문해주시면 도움을 드릴 수 있습니다."
         status_val = "no_match"
         response_type = "fallback"
-        model_name = "Smart Intent-based Response System"
+        model_name = "RAG Search Engine" if (USE_RAG and rag_search_engine) else "Smart Intent-based Response System"
         
         if related_questions_data and len(related_questions_data) > 0:
             best_question = related_questions_data[0]
             
-            if best_question["score"] > 4.0:
+            # RAG 모드: 유사도 임계값 0.7 이상
+            # 레거시 모드: 점수 4.0 이상
+            if USE_RAG and rag_search_engine:
+                threshold_high = 0.8
+                threshold_low = 0.6
+            else:
+                threshold_high = 4.0
+                threshold_low = 1.0
+            
+            if best_question["score"] >= threshold_high:
                 response = best_question["answer"]
                 status_val = "success"
-                response_type = "smart_keyword"
-                matched_keywords = best_question["matched_keywords"]
+                response_type = "rag_search" if (USE_RAG and rag_search_engine) else "smart_keyword"
+                matched_keywords = best_question.get("matched_keywords", [])
                 
+                # 관련 질문 추가
                 for rq in related_questions_data[1:]:
-                    if rq["score"] > 1.5 and rq["id"] != best_question["id"]:
+                    min_related_score = 0.65 if (USE_RAG and rag_search_engine) else 1.5
+                    if rq["score"] >= min_related_score and rq["id"] != best_question["id"]:
                         answer_preview = rq["answer"][:80] + "..." if len(rq["answer"]) > 80 else rq["answer"]
                         related_questions.append(RelatedQuestion(
                             id=rq["id"],
                             question=rq["question"],
                             answer_preview=answer_preview,
                             score=rq["score"],
-                            matched_keywords=rq["matched_keywords"]
+                            matched_keywords=rq.get("matched_keywords", [])
                         ))
-            elif best_question["score"] > 1.0:
+            elif best_question["score"] >= threshold_low:
                 response = best_question["answer"]
                 status_val = "partial_match"
-                response_type = "smart_keyword"
-                matched_keywords = best_question["matched_keywords"]
+                response_type = "rag_search" if (USE_RAG and rag_search_engine) else "smart_keyword"
+                matched_keywords = best_question.get("matched_keywords", [])
         
         # 전체 응답 시간 계산
         total_response_time_ms = (time.time() - total_start_time) * 1000
@@ -406,20 +515,36 @@ def health_check():
         except:
             claude_status = "error"
     
+    # RAG 상태 확인
+    rag_status = "disconnected"
+    vector_count = 0
+    if USE_RAG and rag_search_engine:
+        try:
+            stats = pinecone_client.get_index_stats()
+            vector_count = stats.get('total_vector_count', 0)
+            rag_status = "connected" if vector_count > 0 else "no_data"
+        except:
+            rag_status = "error"
+    
     available_models = []
     if claude_status == "connected":
         available_models.append("Claude-3-Haiku")
-    available_models.append("Keyword-based")
+    if rag_status == "connected":
+        available_models.append("RAG (Pinecone + OpenAI)")
+    else:
+        available_models.append("Keyword-based")
     
     return {
         "status": "healthy",
         "model": f"Intelligent: {' + '.join(available_models)}",
         "device": "CPU",
         "language": "Korean",
-        "qa_count": len(QA_DATABASE),
+        "qa_count": vector_count if (USE_RAG and rag_status == "connected") else len(QA_DATABASE),
         "claude_status": claude_status,
         "claude_available": bool(claude_client),
-        "response_mode": "claude_enhanced_knowledge"
+        "rag_status": rag_status,
+        "rag_available": USE_RAG and rag_search_engine is not None,
+        "response_mode": "rag_enhanced" if (USE_RAG and rag_status == "connected") else "claude_enhanced_knowledge"
     }
 
 @app.get("/info", tags=["Info"])
@@ -429,11 +554,27 @@ def get_info():
     if claude_client:
         available_ai_models.append("Claude-3-Haiku")
     
+    if USE_RAG and rag_search_engine:
+        system_type = "RAG-Enhanced Knowledge System"
+        description = "Pinecone 벡터 DB와 OpenAI 임베딩을 활용한 시맨틱 검색 + Claude 지능형 답변"
+        try:
+            stats = pinecone_client.get_index_stats()
+            qa_count = stats.get('total_vector_count', 0)
+        except:
+            qa_count = 0
+    else:
+        system_type = "Claude-Enhanced Knowledge System"
+        description = "Claude가 키워드 DB를 참고해서 지능적 답변을 생성하는 시스템"
+        qa_count = len(QA_DATABASE)
+    
     return {
         "model_name": f"Intelligent System: {' + '.join(available_ai_models) if available_ai_models else 'Keyword-based'}",
-        "model_type": "Claude-Enhanced Knowledge System",
-        "description": "Claude가 키워드 DB를 참고해서 지능적 답변을 생성하는 시스템",
-        "qa_topics": list(QA_DATABASE.keys())
+        "model_type": system_type,
+        "description": description,
+        "qa_count": qa_count,
+        "rag_enabled": USE_RAG and rag_search_engine is not None,
+        "embedding_model": EMBEDDING_MODEL if USE_RAG else None,
+        "vector_db": "Pinecone" if USE_RAG else None
     }
 
 @app.get("/search", tags=["Search"])
@@ -442,7 +583,16 @@ def search_questions(query: str, limit: Optional[int] = 10, min_score: Optional[
     if not query or not query.strip():
         raise HTTPException(status_code=400, detail="검색어를 입력해주세요.")
     
-    related_questions = find_related_questions_smart(query, limit=limit, min_score=min_score)
+    # RAG 또는 레거시 검색
+    if USE_RAG and rag_search_engine:
+        related_questions = find_related_questions_smart_rag(
+            query, 
+            limit=limit, 
+            min_score=max(min_score, 0.6),
+            rag_engine=rag_search_engine
+        )
+    else:
+        related_questions = find_related_questions_smart_legacy(query, limit=limit, min_score=min_score)
     
     search_results = []
     for rq in related_questions:
